@@ -2,6 +2,7 @@ package simpleforce
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"encoding/xml"
 	"fmt"
@@ -13,6 +14,9 @@ import (
 	"net/url"
 	"os"
 	"strings"
+
+	"golang.org/x/oauth2"
+	"golang.org/x/oauth2/clientcredentials"
 )
 
 const (
@@ -38,6 +42,7 @@ type Client struct {
 	instanceURL   string
 	useToolingAPI bool
 	httpClient    *http.Client
+	tokenSource   oauth2.TokenSource
 }
 
 // QueryResult holds the response data from an SOQL query.
@@ -50,18 +55,18 @@ type QueryResult struct {
 
 // Expose sid to save in admin settings
 func (client *Client) GetSid() (sid string) {
-        return client.sessionID
+	return client.sessionID
 }
 
-//Expose Loc to save in admin settings
+// Expose Loc to save in admin settings
 func (client *Client) GetLoc() (loc string) {
 	return client.instanceURL
 }
 
 // Set SID and Loc as a means to log in without LoginPassword
 func (client *Client) SetSidLoc(sid string, loc string) {
-        client.sessionID = sid
-        client.instanceURL = loc
+	client.sessionID = sid
+	client.instanceURL = loc
 }
 
 // Query runs an SOQL query. q could either be the SOQL string or the nextRecordsURL.
@@ -133,7 +138,7 @@ func (client *Client) SObject(typeName ...string) *SObject {
 
 // isLoggedIn returns if the login to salesforce is successful.
 func (client *Client) isLoggedIn() bool {
-	return client.sessionID != ""
+	return client.sessionID != "" || client.tokenSource != nil
 }
 
 // LoginPassword signs into salesforce using password. token is optional if trusted IP is configured.
@@ -225,6 +230,28 @@ func (client *Client) LoginPassword(username, password, token string) error {
 	return nil
 }
 
+// LoginPassword signs into salesforce using password. token is optional if trusted IP is configured.
+// Ref: https://developer.salesforce.com/docs/atlas.en-us.214.0.api_rest.meta/api_rest/intro_understanding_username_password_oauth_flow.htm
+// Ref: https://developer.salesforce.com/docs/atlas.en-us.214.0.api.meta/api/sforce_api_calls_login.htm
+func (client *Client) LoginClientCredentials(clientSecret string) error {
+	if len(client.clientID) == 0 || len(clientSecret) == 0 {
+		return fmt.Errorf("client id and secret must be provided")
+	}
+
+	tokenURL, err := url.JoinPath(client.baseURL, "/services/oauth2/token")
+	if err != nil {
+		return fmt.Errorf("failed to build token path: %w", err)
+	}
+	conf := clientcredentials.Config{
+		TokenURL:     tokenURL,
+		ClientID:     client.clientID,
+		ClientSecret: clientSecret,
+	}
+
+	client.tokenSource = conf.TokenSource(context.Background())
+	return nil
+}
+
 // httpRequest executes an HTTP request to the salesforce server and returns the response data in byte buffer.
 func (client *Client) httpRequest(method, url string, body io.Reader) ([]byte, error) {
 	req, err := http.NewRequest(method, url, body)
@@ -232,7 +259,16 @@ func (client *Client) httpRequest(method, url string, body io.Reader) ([]byte, e
 		return nil, err
 	}
 
-	req.Header.Add("Authorization", fmt.Sprintf("Bearer %s", client.sessionID))
+	if client.tokenSource != nil {
+		token, err := client.tokenSource.Token()
+		if err != nil {
+			return nil, fmt.Errorf("failed to retrieve oauth token: %w", err)
+		}
+		token.SetAuthHeader(req)
+	} else {
+		req.Header.Add("Authorization", fmt.Sprintf("Bearer %s", client.sessionID))
+	}
+
 	req.Header.Add("Content-Type", "application/json")
 
 	resp, err := client.httpClient.Do(req)
@@ -263,16 +299,14 @@ func (client *Client) makeURL(req string) string {
 
 // NewClient creates a new instance of the client.
 func NewClient(url, clientID, apiVersion string) *Client {
-	client := &Client{
-		apiVersion: apiVersion,
-		baseURL:    url,
-		clientID:   clientID,
-		httpClient: &http.Client{},
-	}
-
 	// Remove trailing "/" from base url to prevent "//" when paths are appended
-	if strings.HasSuffix(client.baseURL, "/") {
-		client.baseURL = client.baseURL[:len(client.baseURL)-1]
+	url = strings.TrimSuffix(url, "/")
+	client := &Client{
+		apiVersion:  apiVersion,
+		baseURL:     url,
+		instanceURL: url,
+		clientID:    clientID,
+		httpClient:  &http.Client{},
 	}
 	return client
 }
@@ -332,7 +366,7 @@ func parseHost(input string) string {
 	return "Failed to parse URL input"
 }
 
-//Get the List of all available objects and their metadata for your organization's data
+// Get the List of all available objects and their metadata for your organization's data
 func (client *Client) DescribeGlobal() (*SObjectMeta, error) {
 	apiPath := fmt.Sprintf("/services/data/v%s/sobjects", client.apiVersion)
 	baseURL := strings.TrimRight(client.baseURL, "/")
